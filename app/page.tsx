@@ -14,9 +14,17 @@ type Usage = {
   output_tokens?: number;
   cache_creation_input_tokens?: number;
   cache_read_input_tokens?: number;
+  lead_calls?: number;
+  subagent_calls?: number;
 };
 
-type Result = { memo: string; trace: Trace[]; usage: Usage };
+type Result = {
+  memo: string;
+  trace: Trace[];
+  usage: Usage;
+  engine: "claude" | "demo";
+  notice: string | null;
+};
 
 const PRESETS: { name: string; query: string; holdings: Record<string, number> }[] = [
   {
@@ -102,9 +110,9 @@ export default function Home() {
         </h1>
         <p className="text-gray-400 max-w-2xl leading-relaxed">
           A lead orchestrator (Claude Sonnet 4.6, adaptive thinking) dispatches to three specialist
-          sub-agents (Claude Haiku 4.5) via tool-use — market data, news sentiment, risk concentration —
-          then synthesizes their briefings into a decision-grade memo. Prompt caching on every
-          system prompt and the lead&apos;s tool definitions.
+          sub-agents (Claude Haiku 4.5) through tool use, covering market data, news sentiment, and
+          risk concentration, then synthesizes their briefings into a decision-grade memo. All
+          data is fictional.
         </p>
       </header>
 
@@ -172,8 +180,7 @@ export default function Home() {
           )}
 
           <p className="text-xs text-gray-600 mt-6">
-            Coverage: AAPL · MSFT · NVDA · JPM · XOM (mock data — replace with a real provider in
-            production)
+            Coverage: AAPL · MSFT · NVDA · JPM · XOM (mock data, not market advice)
           </p>
         </section>
 
@@ -182,6 +189,20 @@ export default function Home() {
           <p className="text-xs font-semibold tracking-widest text-gray-500 uppercase mb-3">
             Analyst memo
           </p>
+          {result && (
+            <div className="flex flex-wrap items-center gap-2 mb-3 text-xs text-gray-400">
+              <span
+                className={`font-semibold rounded-md px-2 py-0.5 ${
+                  result.engine === "claude"
+                    ? "bg-violet-500/20 text-violet-300"
+                    : "bg-amber-500/15 text-amber-300"
+                }`}
+              >
+                {result.engine === "claude" ? "Claude" : "Rule-based demo"}
+              </span>
+              {result.notice && <span>{result.notice}</span>}
+            </div>
+          )}
           <div className="bg-white/[0.03] border border-white/[0.06] rounded-2xl p-6 min-h-[200px] mb-6">
             {result ? (
               <article className="prose prose-invert prose-sm max-w-none whitespace-pre-wrap text-gray-200 leading-relaxed">
@@ -197,7 +218,7 @@ export default function Home() {
           {result && (
             <>
               <p className="text-xs font-semibold tracking-widest text-gray-500 uppercase mb-3">
-                Sub-agent trace
+                {result.engine === "demo" ? "Rule-based steps" : "Sub-agent trace"}
               </p>
               <div className="space-y-3 mb-6">
                 {result.trace.map((t, i) => (
@@ -206,21 +227,27 @@ export default function Home() {
               </div>
 
               <p className="text-xs font-semibold tracking-widest text-gray-500 uppercase mb-3">
-                Usage
+                Usage, all calls
               </p>
-              <div className="grid grid-cols-2 gap-3 text-xs">
-                <Stat label="Input tokens" value={result.usage.input_tokens ?? 0} />
-                <Stat label="Output tokens" value={result.usage.output_tokens ?? 0} />
-                <Stat
-                  label="Cache write"
-                  value={result.usage.cache_creation_input_tokens ?? 0}
-                />
-                <Stat
-                  label="Cache read"
-                  value={result.usage.cache_read_input_tokens ?? 0}
-                  highlight
-                />
-              </div>
+              {result.engine === "demo" ? (
+                <p className="text-xs text-gray-500">No model calls, so no tokens were used.</p>
+              ) : (
+                <div className="grid grid-cols-2 gap-3 text-xs">
+                  <Stat label="Lead calls" value={result.usage.lead_calls ?? 0} />
+                  <Stat label="Sub-agent calls" value={result.usage.subagent_calls ?? 0} />
+                  <Stat label="Input tokens" value={result.usage.input_tokens ?? 0} />
+                  <Stat label="Output tokens" value={result.usage.output_tokens ?? 0} />
+                  <Stat
+                    label="Cache write"
+                    value={result.usage.cache_creation_input_tokens ?? 0}
+                  />
+                  <Stat
+                    label="Cache read"
+                    value={result.usage.cache_read_input_tokens ?? 0}
+                    highlight
+                  />
+                </div>
+              )}
             </>
           )}
         </section>
@@ -264,7 +291,7 @@ function TraceEntry({ entry }: { entry: Trace }) {
   }
   return (
     <div className="border border-rose-500/30 bg-rose-500/[0.04] rounded-xl px-4 py-3">
-      <div className="text-xs font-semibold text-rose-300 mb-1">{entry.name} — error</div>
+      <div className="text-xs font-semibold text-rose-300 mb-1">{entry.name}: error</div>
       <p className="text-xs text-gray-400">{entry.text}</p>
     </div>
   );
