@@ -11,3 +11,5 @@ __pycache__/
 venv/
 .DS_Store
 *.log
+evals/last_run.json
+next-env.d.ts

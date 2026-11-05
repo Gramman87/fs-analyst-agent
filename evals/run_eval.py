@@ -1,12 +1,14 @@
 """
-Run the agent against every case in cases.py and score on three dimensions:
+Run the agent against every case in cases.py and score it on four dimensions:
 
-  1. Routing correctness   — did the lead call (at least) the expected sub-agents?
-  2. Coverage              — do the must_mention substrings appear in the memo?
-  3. Judge quality (1-5)   — Opus 4.7 grades the memo against a rubric.
+  1. Routing     did the lead call (at least) the expected sub-agents?
+  2. Coverage    does the memo mention the required terms as whole words?
+  3. Judge       a separate model grades the memo against a rubric, 1-5. Anything below 3 fails.
+  4. Grounding   figures in the memo that appear in no briefing. Reported for review, not a failure,
+                 since a memo can legitimately derive a number.
 
-Prints a per-case table and aggregates. Exits non-zero if any case fails routing
-or coverage hard checks. Run from the repo root:
+This calls the live API and spends credits, so it isn't part of CI. Exits non-zero if any case fails.
+Run it from the repo root:
 
     ANTHROPIC_API_KEY=... python evals/run_eval.py
 """
@@ -24,12 +26,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "api"))
 sys.path.insert(0, HERE)
 
-from anthropic import Anthropic  # noqa: E402
-
-from agents import run_lead  # noqa: E402
+from agents import client, run_lead  # noqa: E402
 from cases import CASES  # noqa: E402
+from scoring import (  # noqa: E402
+    JUDGE_SCHEMA,
+    case_passed,
+    check_coverage,
+    check_routing,
+    parse_judge,
+    unsupported_figures,
+)
 
-JUDGE_MODEL = "claude-opus-4-7"
+JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "claude-opus-4-7")
 
 JUDGE_SYSTEM = """You are a senior sell-side research director grading an analyst memo. Score on three dimensions, 1-5 each:
 
@@ -37,29 +45,31 @@ JUDGE_SYSTEM = """You are a senior sell-side research director grading an analys
 - specificity: does it cite specific tickers, sectors, drivers — not vague platitudes?
 - decisiveness: does it directly answer the client question and pick a side, or does it hedge?
 
-Return ONLY a JSON object with keys: accuracy, specificity, decisiveness, critique (one sentence). No prose, no markdown fence."""
+Also give a one-sentence critique."""
 
 
 def score_one(case: dict[str, Any]) -> dict[str, Any]:
     t0 = time.time()
-    result = run_lead(case["query"], case["holdings"])
+    # A long eval shouldn't be cut off by the serverless function's deadline.
+    result = run_lead(case["query"], case["holdings"], deadline_s=300)
     elapsed_s = time.time() - t0
 
     called_tools = {t["name"] for t in result["trace"] if t["kind"] == "tool_call"}
-    expected = case["expected_tools"]
-    routing_pass = expected.issubset(called_tools)
+    routing_pass = check_routing(called_tools, case["expected_tools"])
 
     memo = result["memo"]
-    missing_mentions = [m for m in case["must_mention"] if m.lower() not in memo.lower()]
-    coverage_pass = not missing_mentions
+    missing_mentions = check_coverage(memo, case["must_mention"])
+    briefings = [t["text"] for t in result["trace"] if t["kind"] == "tool_result"]
 
     # Claude-as-judge
-    judge_client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    judge_resp = judge_client.messages.create(
+    judge_resp = client().messages.create(
         model=JUDGE_MODEL,
         max_tokens=1500,
         thinking={"type": "adaptive"},
-        output_config={"effort": "high"},
+        output_config={
+            "effort": "high",
+            "format": {"type": "json_schema", "schema": JUDGE_SCHEMA},
+        },
         system=JUDGE_SYSTEM,
         messages=[
             {
@@ -78,25 +88,26 @@ def score_one(case: dict[str, Any]) -> dict[str, Any]:
             }
         ],
     )
-    judge_text = "".join(b.text for b in judge_resp.content if b.type == "text").strip()
-    try:
-        judge = json.loads(judge_text)
-    except json.JSONDecodeError:
-        judge = {"accuracy": 0, "specificity": 0, "decisiveness": 0, "critique": "judge returned non-JSON"}
+    judge = parse_judge("".join(b.text for b in judge_resp.content if b.type == "text"))
 
     return {
         "id": case["id"],
         "routing_pass": routing_pass,
         "called_tools": sorted(called_tools),
-        "coverage_pass": coverage_pass,
+        "coverage_pass": not missing_mentions,
         "missing_mentions": missing_mentions,
         "judge": judge,
+        "unsupported_figures": unsupported_figures(memo, briefings, case["holdings"]),
         "elapsed_s": round(elapsed_s, 1),
         "usage": result.get("usage", {}),
     }
 
 
 def main() -> int:
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("ANTHROPIC_API_KEY is not set. This eval calls the live API.")
+        return 2
+
     print(f"Running {len(CASES)} eval cases against the agent…\n")
     results = []
     for case in CASES:
@@ -124,7 +135,7 @@ def main() -> int:
         coverage_passes += int(r["coverage_pass"])
         j = r["judge"]
         for k in judge_totals:
-            judge_totals[k] += int(j.get(k, 0))
+            judge_totals[k] += int(j.get(k) or 0)
         print(
             f"{r['id']:32s} "
             f"{'PASS' if r['routing_pass'] else 'FAIL':>8s} "
@@ -133,6 +144,8 @@ def main() -> int:
             f"{j.get('specificity',0):>5} "
             f"{j.get('decisiveness',0):>4}"
         )
+        if r["unsupported_figures"]:
+            print(f"{'':32s} check these figures: {', '.join(r['unsupported_figures'])}")
 
     if counted:
         print()
@@ -151,9 +164,7 @@ def main() -> int:
         json.dump(results, f, indent=2)
     print(f"\nFull results: {out_path}")
 
-    # Non-zero exit if any case failed routing or coverage
-    failures = [r for r in results if "error" in r or not r.get("routing_pass") or not r.get("coverage_pass")]
-    return 1 if failures else 0
+    return 0 if all(case_passed(r) for r in results) else 1
 
 
 if __name__ == "__main__":

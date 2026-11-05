@@ -1,5 +1,5 @@
 """Hand-written eval cases. Each names the query, portfolio, expected sub-agents,
-and must-mention substrings that prove the memo grounded in the briefings."""
+and terms the memo must mention as whole words. "a|b" accepts either spelling."""
 
 CASES = [
     {
@@ -11,7 +11,7 @@ CASES = [
             "query_news_sentiment",
             "analyze_risk_concentration",
         },
-        "must_mention": ["NVDA", "tech", "concentration"],
+        "must_mention": ["NVDA", "tech|technology", "concentration|concentrated"],
     },
     {
         "id": "rate_cut_value_thesis",
