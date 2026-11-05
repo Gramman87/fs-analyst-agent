@@ -36,7 +36,7 @@ const PRESETS: { name: string; query: string; holdings: Record<string, number> }
   {
     name: "Balanced 60/30/10",
     query:
-      "Walk me through what's moving this portfolio right now and where the asymmetry sits — what's most likely to surprise me on the upside vs. the downside?",
+      "Walk me through what's moving this portfolio right now and where the asymmetry sits: what's most likely to surprise me on the upside vs. the downside?",
     holdings: { MSFT: 0.25, AAPL: 0.2, NVDA: 0.15, JPM: 0.3, XOM: 0.1 },
   },
   {
