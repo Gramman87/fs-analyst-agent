@@ -1,127 +1,120 @@
-# Portfolio Analyst Agent — Claude Sub-Agent POC
+# Portfolio Analyst Agent
 
-A financial-services portfolio analyst built as a **lead orchestrator + three specialist sub-agents** on the Claude API. The lead (Sonnet 4.6, adaptive thinking) plans the analysis and dispatches to sub-agents (Haiku 4.5) via tool-use; the sub-agents own a slice of domain expertise each. The final memo is what an analyst would hand to a portfolio manager.
+**Live demo:** https://fs-analyst-agent.vercel.app
 
-Built as a demo for the kind of production deployment patterns an Anthropic Forward Deployed Engineer ships to enterprise customers.
+A financial-services portfolio analyst built as a lead orchestrator with three specialist sub-agents on the Claude API. The lead plans the analysis and dispatches through tool use, the sub-agents each own one slice of the work, and the result is a memo an analyst could hand to a portfolio manager. All market data and news are fictional.
 
-## Live demo
-
-UI: enter a portfolio + a client question, get a memo back. The right panel surfaces the lead's thinking, every sub-agent invocation, and the cache hit/miss telemetry.
-
-## Architecture
+## How it works
 
 ```
   client question + portfolio
             │
             ▼
    ┌────────────────────────────┐
-   │  LEAD ORCHESTRATOR         │  Sonnet 4.6
-   │  (adaptive thinking)       │  + cached system prompt + cached tool defs
-   │                            │
-   │  Tools (= sub-agents):     │
-   │   • query_market_data      │
-   │   • query_news_sentiment   │
-   │   • analyze_risk_…         │
+   │  LEAD ORCHESTRATOR         │  claude-sonnet-4-6
+   │  plans, then writes memo   │  adaptive thinking
    └──────────────┬─────────────┘
-                  │ tool_use loop
+                  │ tool use, run concurrently
         ┌─────────┼─────────┐
         ▼         ▼         ▼
-  ┌──────────┐ ┌──────────┐ ┌──────────┐
-  │ MARKET   │ │ NEWS     │ │ RISK     │  Haiku 4.5
-  │ DATA     │ │ SENTIMENT│ │ CONCENT. │  + cached system prompts
-  └──────────┘ └──────────┘ └──────────┘
-        │         │         │
-        └─────────┼─────────┘
+   ┌────────┐ ┌────────┐ ┌────────┐
+   │ MARKET │ │ NEWS   │ │ RISK   │  claude-haiku-4-5
+   │ DATA   │ │ DESK   │ │        │
+   └────────┘ └────────┘ └────────┘
+                  │
                   ▼
-       analyst memo + trace
+        memo + trace + usage
 ```
 
-The lead never touches raw data — it only sees sub-agent briefings. Each sub-agent loads its own data slice (mocked here; replace with a real provider in production) and calls Haiku with a focused system prompt.
+- **The lead never touches raw data.** It only sees sub-agent briefings.
+- **Sub-agents in the same turn run concurrently,** and their results go back in one message in call order.
+- **Calculations are done in code.** Portfolio beta and sector weights come from `api/metrics.py`, and the risk sub-agent is told to report them rather than redo the math.
+- **A failed sub-agent doesn't end the request.** The lead gets the error and works with what it has.
 
-## What this demonstrates
+## Which engine answers
 
-| FDE Applied AI JD beat | Where it lives in this repo |
-|---|---|
-| Production application on Claude | `api/analyze.py` — Vercel serverless function |
-| Sub-agents | `api/agents.py` — three Haiku-backed sub-agents invoked via tool-use |
-| Agent skills | Each sub-agent's system prompt is its skill — focused, cached, replaceable |
-| Evaluation frameworks | `evals/run_eval.py` — 5 hand-written cases, routing + coverage checks, Claude-as-judge with Opus 4.7 |
-| Repeatable deployment pattern | Lead/sub-agent split + cache placement + eval harness is portable to any vertical |
-| Python proficiency | All backend logic in Python; Next.js TS only for the frontend |
-| Enterprise verticals | Flavored for financial services (portfolio analysis); the pattern is vertical-neutral |
+Every response says which engine wrote it, so a template is never presented as model output.
 
-## Prompt caching strategy
+| Situation | Who answers |
+| --------- | ----------- |
+| API key set, under the daily limit | Claude |
+| No API key | Rule-based demo |
+| Daily limit reached | Rule-based demo, with no API call |
+| API error, refusal, truncated memo, or past the 50-second deadline | Rule-based demo |
 
-Caching is a prefix match — any byte change in the prefix invalidates everything after. Render order is `tools → system → messages`, so:
+The demo engine does real calculations over the mock data, but it doesn't read the question, and its memo says so.
 
-- **Lead**: `cache_control: ephemeral` on the system prompt block. Since `tools` render before `system`, this caches **both tool defs + system** in one breakpoint. The tool-use loop makes 2-N `messages.create` calls per request; iterations 2+ all hit cache for the tools+system prefix.
-- **Sub-agents**: `cache_control: ephemeral` on each sub-agent's system prompt. If the lead invokes the same sub-agent twice in one analysis (e.g. market data on multiple ticker sets), the second call reads from cache.
+`ANALYZE_DAILY_LIMIT` is counted per server instance and resets on a cold start, so it limits runaway use without being a hard cap. Set a spending limit on the API key for that.
 
-Telemetry: the UI surfaces `cache_creation_input_tokens` (write, ~1.25×) vs `cache_read_input_tokens` (read, ~0.1×). Cache reads should dominate after the first iteration.
+## Prompt caching
 
-## Model choice
+Requests set a cache marker, and the UI reports cache writes and reads across every model call in the request. Expect low numbers with the default models:
 
-| Role | Model | Why |
-|---|---|---|
-| Lead orchestrator | `claude-sonnet-4-6` | Strong tool-use planning at lower cost than Opus; adaptive thinking included |
-| Sub-agents | `claude-haiku-4-5` | Cheap, fast, focused tasks; the sub-agent system prompts do the heavy lifting |
-| Eval judge | `claude-opus-4-7` (effort: high) | Most capable model for grading; runs offline, cost not in critical path |
+- A prefix only caches above a model-specific minimum, and shorter prefixes silently don't. That minimum is 1,024 tokens for Sonnet 4.6 and 4,096 for Haiku 4.5.
+- The lead's tools and system prompt come to roughly 600 tokens, so its first turn can't cache. The prefix can only pass the minimum once briefings are in the conversation.
+- The sub-agent prompts are around 100 tokens and will never reach the Haiku 4.5 minimum, so they don't set a marker.
 
-This mirrors Anthropic's own canonical pattern (Claude Code uses Haiku for its Explore sub-agents).
+## Evals
 
-## Running locally
+`evals/run_eval.py` runs five hand-written cases against the live API and scores each one:
 
-```bash
-cp .env.example .env.local       # add your ANTHROPIC_API_KEY
-npm install
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-npm run dev                       # http://localhost:3000
-```
-
-The Python serverless function under `api/analyze.py` is served by Vercel's Python runtime (or `vercel dev` locally). Next.js handles the frontend.
-
-## Running the evals
+| Check | What it does | Fails the case? |
+| ----- | ------------ | --------------- |
+| Routing | The lead called the expected sub-agents | Yes |
+| Coverage | The memo mentions required terms, as whole words | Yes |
+| Judge | A separate model scores accuracy, specificity, and decisiveness from 1 to 5 | Yes, below 3 or if the reply is unreadable |
+| Grounding | Lists figures in the memo that appear in no briefing | No, it's for review, because a memo can derive a number |
 
 ```bash
 source .venv/bin/activate
-ANTHROPIC_API_KEY=sk-ant-... python evals/run_eval.py
+ANTHROPIC_API_KEY=... python evals/run_eval.py
 ```
 
-Output:
-- per-case pass/fail on routing + coverage
-- per-case judge scores on accuracy / specificity / decisiveness (1-5 each)
-- aggregate pass rates and judge averages
-- full results dumped to `evals/last_run.json`
-- non-zero exit if any case fails — wire into CI
+This spends API credits, so it runs by hand and isn't part of CI. Results are saved to `evals/last_run.json`. Five cases can catch regressions, but they aren't a quality measurement.
 
-## Deployment to Vercel
+## Run it locally
 
-1. Push to a GitHub repo
-2. Import to Vercel — it detects Next.js automatically
-3. Set `ANTHROPIC_API_KEY` in the Vercel project's env vars
-4. The Python serverless function under `api/` deploys alongside the Next.js app
+```bash
+npm install
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 
-`vercel.json` sets `maxDuration: 60` for the Python function (the lead's tool-use loop can take 15-30s on a full 3-sub-agent dispatch).
+npm run dev:api    # the Python API on :8000
+npm run dev        # the UI on http://localhost:3000, in a second terminal
+```
+
+Without a key, it runs on the demo engine. To use Claude, export the variables in `.env.example` before `npm run dev:api`.
+
+## Test
+
+```bash
+.venv/bin/python -m pytest
+npm run lint && npm run typecheck && npm run build
+```
+
+The tests need no API key and remove any key in your environment, so they never spend credits. They run the real Anthropic SDK against a local transport, which covers request building, response parsing, the tool loop, each fallback path, and the eval's scoring. That shows the app handles the API as modeled in the tests. It doesn't replace a run against the live API.
+
+## Deploy
+
+Import the repo into Vercel and set `ANTHROPIC_API_KEY`. Next.js serves the UI and `api/analyze.py` deploys as a Python function, with a 60-second limit set in `vercel.json`.
 
 ## Limitations
 
-- **Mock data.** `api/mocks.py` ships hand-written market data and news for 5 tickers. Production would swap in a real provider (Polygon, FMP, Benzinga, etc.).
-- **Coverage is small.** 5 tickers. Adding more is just adding entries to `mocks.py`.
-- **No portfolio persistence.** Each request is stateless.
-- **Eval cases are hand-written.** Five cases is enough to catch regressions but you'd want 20-50 for production confidence.
+- **Mock data:** five tickers with hand-written figures and headlines.
+- **Stateless:** nothing is saved between requests.
+- **No authentication:** anyone can call the endpoint, so it relies on input limits, the daily limit, and the key's spending limit.
 
 ## Files
 
 ```
-fs-analyst-agent/
-├── api/
-│   ├── analyze.py       # Vercel serverless entry point
-│   ├── agents.py        # Lead orchestrator + 3 sub-agents
-│   └── mocks.py         # Mock market data + news corpus
-├── app/                 # Next.js frontend (TS)
-├── evals/
-│   ├── cases.py         # Hand-written test cases
-│   └── run_eval.py      # Runner with Claude-as-judge scoring
-└── vercel.json          # Python function config (60s max duration)
+api/
+  analyze.py    HTTP handler and input validation
+  engine.py     Chooses the engine, daily limit
+  agents.py     Lead orchestrator and sub-agents
+  demo.py       Rule-based engine
+  metrics.py    Portfolio calculations
+  mocks.py      Mock market data and news
+app/            Next.js UI
+evals/          Cases, scoring rules, and the live runner
+tests/          Offline tests
+scripts/        Local API server
 ```
