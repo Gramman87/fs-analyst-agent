@@ -1,33 +1,40 @@
 """
 Lead orchestrator + three specialist sub-agents.
 
-Architecture:
-- Lead (Sonnet 4.6, adaptive thinking) plans the analysis and dispatches
-  to sub-agents via tool-use. The lead never touches raw data.
-- Sub-agents (Haiku 4.5) each own one slice of domain expertise:
-    * market_data_subagent  — price action, valuation, vol
-    * news_sentiment_subagent — headlines, drivers, tone
-    * risk_concentration_subagent — sector / single-name concentration
-  Each sub-agent loads its slice of mock data and calls Haiku with a
-  focused, cached system prompt.
-- Caching: every system prompt + the lead's tool definitions are marked
-  cacheable. On the lead's tool-use loop, subsequent iterations hit cache
-  for tools+system; sub-agent calls within the same request hit cache for
-  their system prompts after the first call.
+The lead plans the analysis and dispatches to sub-agents through tool use, and never touches raw data.
+Each sub-agent owns one slice of expertise, loads its slice of mock data, and calls a smaller model with
+a focused system prompt. Tool calls from one turn run concurrently, and everything a request spends is
+counted in `Run` so the UI can show the true totals.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from anthropic import Anthropic
 
+from metrics import portfolio_metrics
 from mocks import SUPPORTED_TICKERS, get_market_data, get_news
 
-LEAD_MODEL = "claude-sonnet-4-6"
-SUBAGENT_MODEL = "claude-haiku-4-5"
+LEAD_MODEL = os.environ.get("LEAD_MODEL", "claude-sonnet-4-6")
+SUBAGENT_MODEL = os.environ.get("SUBAGENT_MODEL", "claude-haiku-4-5")
+
+# The Vercel function is killed at 60 seconds (vercel.json). Stopping earlier leaves time to answer.
+REQUEST_DEADLINE_S = 50.0
+MAX_LEAD_TURNS = 8
+MAX_PARALLEL_TOOLS = 8
+
+USAGE_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
 
 _client: Anthropic | None = None
 
@@ -35,8 +42,56 @@ _client: Anthropic | None = None
 def client() -> Anthropic:
     global _client
     if _client is None:
-        _client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        # No SDK retries: a retry could outlast the request deadline, and the caller has a fallback.
+        _client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"], max_retries=0)
     return _client
+
+
+class AgentStopped(Exception):
+    """The lead couldn't produce a memo: refusal, truncation, turn cap, or out of time."""
+
+
+class Run:
+    """State for one request: the time left and the tokens spent across every model call."""
+
+    def __init__(self, deadline_s: float = REQUEST_DEADLINE_S):
+        self._deadline = time.monotonic() + deadline_s
+        self._lock = threading.Lock()
+        self._totals = {field: 0 for field in USAGE_FIELDS}
+        self._calls = {"lead": 0, "subagent": 0}
+
+    def create(self, role: str, **params: Any) -> Any:
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise AgentStopped("request deadline reached")
+        response = client().with_options(timeout=remaining).messages.create(**params)
+        with self._lock:
+            self._calls[role] += 1
+            for field in USAGE_FIELDS:
+                self._totals[field] += getattr(response.usage, field, 0) or 0
+        return response
+
+    def usage(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                **self._totals,
+                "lead_calls": self._calls["lead"],
+                "subagent_calls": self._calls["subagent"],
+            }
+
+
+def _ask_subagent(run: Run, system: str, user_msg: str, max_tokens: int) -> str:
+    response = run.create(
+        "subagent",
+        model=SUBAGENT_MODEL,
+        max_tokens=max_tokens,
+        system=system,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+    text = _first_text(response)
+    if response.stop_reason == "refusal" or not text:
+        raise RuntimeError(f"no briefing returned (stop_reason={response.stop_reason})")
+    return text
 
 
 # ---------- Sub-agent: market data ----------
@@ -52,25 +107,13 @@ You receive structured market data for a set of tickers and write a tight 3-5 se
 Stay factual. No buy/sell recommendations, no forward predictions. The lead analyst will synthesize. Always cite specific numbers from the data you were given."""
 
 
-def market_data_subagent(tickers: list[str]) -> str:
+def market_data_subagent(run: Run, tickers: list[str]) -> str:
     data = get_market_data(tickers)
     user_msg = (
         f"Brief the lead analyst on market data for: {', '.join(tickers)}\n\n"
         f"```json\n{json.dumps(data, indent=2)}\n```"
     )
-    resp = client().messages.create(
-        model=SUBAGENT_MODEL,
-        max_tokens=600,
-        system=[
-            {
-                "type": "text",
-                "text": MARKET_DATA_SYSTEM,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[{"role": "user", "content": user_msg}],
-    )
-    return _first_text(resp)
+    return _ask_subagent(run, MARKET_DATA_SYSTEM, user_msg, 600)
 
 
 # ---------- Sub-agent: news sentiment ----------
@@ -85,45 +128,34 @@ You receive recent headlines for a set of tickers. For each ticker, output:
 Be concise. No price targets. The lead analyst will weigh this against fundamentals."""
 
 
-def news_sentiment_subagent(tickers: list[str], window: str = "recent") -> str:
+def news_sentiment_subagent(run: Run, tickers: list[str], window: str = "recent") -> str:
     news = get_news(tickers)
     user_msg = (
         f"Brief the lead analyst on {window} news sentiment for: {', '.join(tickers)}\n\n"
         f"```json\n{json.dumps(news, indent=2)}\n```"
     )
-    resp = client().messages.create(
-        model=SUBAGENT_MODEL,
-        max_tokens=900,
-        system=[
-            {
-                "type": "text",
-                "text": NEWS_SENTIMENT_SYSTEM,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[{"role": "user", "content": user_msg}],
-    )
-    return _first_text(resp)
+    return _ask_subagent(run, NEWS_SENTIMENT_SYSTEM, user_msg, 900)
 
 
 # ---------- Sub-agent: risk concentration ----------
 
 RISK_SYSTEM = """You are a sell-side risk specialist.
 
-You receive a portfolio (ticker → weight) and structured market data including sectors and betas. Output:
+You receive a portfolio (ticker → weight), metrics already computed from it, and market data including betas and volatility. Output:
 - Top 2 single-name concentrations with weights
 - Sector concentration (rolled-up sector weights)
-- Portfolio beta estimate (weighted average of name betas)
+- Portfolio beta
 - One sentence flagging the dominant tail risk implied by the concentration
 
-Be quantitative. No recommendations. The lead analyst will translate."""
+Report the computed metrics exactly as given. Don't recalculate them. Be quantitative. No recommendations. The lead analyst will translate."""
 
 
-def risk_concentration_subagent(holdings: dict[str, float]) -> str:
+def risk_concentration_subagent(run: Run, holdings: dict[str, float]) -> str:
     tickers = list(holdings.keys())
     data = get_market_data(tickers)
     payload = {
         "holdings": holdings,
+        "computed_metrics": portfolio_metrics(holdings),
         "market_data": {
             t: {
                 "sector": data[t].get("sector"),
@@ -138,19 +170,7 @@ def risk_concentration_subagent(holdings: dict[str, float]) -> str:
         "Analyze concentration and risk for this portfolio.\n\n"
         f"```json\n{json.dumps(payload, indent=2)}\n```"
     )
-    resp = client().messages.create(
-        model=SUBAGENT_MODEL,
-        max_tokens=700,
-        system=[
-            {
-                "type": "text",
-                "text": RISK_SYSTEM,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[{"role": "user", "content": user_msg}],
-    )
-    return _first_text(resp)
+    return _ask_subagent(run, RISK_SYSTEM, user_msg, 700)
 
 
 # ---------- Lead orchestrator ----------
@@ -230,16 +250,35 @@ TOOLS = [
 
 
 SUBAGENT_DISPATCH = {
-    "query_market_data": lambda inp: market_data_subagent(inp["tickers"]),
-    "query_news_sentiment": lambda inp: news_sentiment_subagent(
-        inp["tickers"], inp.get("window", "recent")
+    "query_market_data": lambda run, inp: market_data_subagent(run, inp["tickers"]),
+    "query_news_sentiment": lambda run, inp: news_sentiment_subagent(
+        run, inp["tickers"], inp.get("window", "recent")
     ),
-    "analyze_risk_concentration": lambda inp: risk_concentration_subagent(inp["holdings"]),
+    "analyze_risk_concentration": lambda run, inp: risk_concentration_subagent(run, inp["holdings"]),
 }
 
 
-def run_lead(query: str, holdings: dict[str, float]) -> dict[str, Any]:
-    """Run the lead orchestrator through a full tool-use loop. Returns memo + trace."""
+def _run_tool(run: Run, block: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run one sub-agent. A failure goes back to the lead as an error it can work around."""
+    trace: list[dict[str, Any]] = [{"kind": "tool_call", "name": block.name, "input": block.input}]
+    try:
+        if block.name not in SUBAGENT_DISPATCH:
+            raise ValueError("unknown tool")
+        text = SUBAGENT_DISPATCH[block.name](run, block.input)
+    except Exception as e:
+        err = f"Sub-agent {block.name} failed: {e}"
+        trace.append({"kind": "tool_error", "name": block.name, "text": err})
+        return trace, {"type": "tool_result", "tool_use_id": block.id, "content": err, "is_error": True}
+    trace.append({"kind": "tool_result", "name": block.name, "text": text})
+    return trace, {"type": "tool_result", "tool_use_id": block.id, "content": text}
+
+
+def run_lead(query: str, holdings: dict[str, float], deadline_s: float = REQUEST_DEADLINE_S) -> dict[str, Any]:
+    """Run the lead through a full tool-use loop and return the memo, trace, and total usage.
+
+    Raises AgentStopped, or an anthropic.APIError, if there's no memo to return.
+    """
+    run = Run(deadline_s)
     trace: list[dict[str, Any]] = []
     messages: list[dict[str, Any]] = [
         {
@@ -252,87 +291,41 @@ def run_lead(query: str, holdings: dict[str, float]) -> dict[str, Any]:
         }
     ]
 
-    for _ in range(8):  # hard cap on iterations
-        resp = client().messages.create(
+    for _ in range(MAX_LEAD_TURNS):
+        resp = run.create(
+            "lead",
             model=LEAD_MODEL,
-            max_tokens=4000,
+            max_tokens=8000,
             thinking={"type": "adaptive"},
-            system=[
-                {
-                    "type": "text",
-                    "text": LEAD_SYSTEM,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
+            # Marks the newest block, so the prefix grows with each tool turn. Below the model's
+            # minimum prefix size this silently does nothing, which `usage` will show.
+            cache_control={"type": "ephemeral"},
+            system=LEAD_SYSTEM,
             tools=TOOLS,
             messages=messages,
         )
 
-        # Record any thinking the lead did this turn
         for block in resp.content:
             if block.type == "thinking" and getattr(block, "thinking", ""):
                 trace.append({"kind": "thinking", "text": block.thinking})
 
         if resp.stop_reason == "end_turn":
-            memo = "".join(b.text for b in resp.content if b.type == "text")
-            usage = resp.usage
-            return {
-                "memo": memo,
-                "trace": trace,
-                "usage": {
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens,
-                    "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", 0),
-                    "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", 0),
-                },
-            }
-
+            return {"memo": _first_text(resp), "trace": trace, "usage": run.usage()}
         if resp.stop_reason != "tool_use":
-            return {
-                "memo": f"_Lead halted with stop_reason={resp.stop_reason}._",
-                "trace": trace,
-                "usage": {},
-            }
+            raise AgentStopped(f"lead stopped with stop_reason={resp.stop_reason}")
 
-        # Execute every tool_use block this turn, in order
-        tool_results = []
-        for block in resp.content:
-            if block.type != "tool_use":
-                continue
-            tool_name = block.name
-            tool_input = block.input
-            trace.append({"kind": "tool_call", "name": tool_name, "input": tool_input})
-            try:
-                result_text = SUBAGENT_DISPATCH[tool_name](tool_input)
-                trace.append({"kind": "tool_result", "name": tool_name, "text": result_text})
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result_text,
-                    }
-                )
-            except Exception as e:  # surface the error to the lead, don't crash
-                err = f"Sub-agent {tool_name} failed: {e}"
-                trace.append({"kind": "tool_error", "name": tool_name, "text": err})
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": err,
-                        "is_error": True,
-                    }
-                )
+        calls = [block for block in resp.content if block.type == "tool_use"]
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_TOOLS) as pool:
+            finished = list(pool.map(lambda block: _run_tool(run, block), calls))
 
-        # Append full assistant content (preserves thinking blocks) + tool results
+        # All results go back in one user message, in call order. The full assistant content goes
+        # back too, because thinking blocks have to stay with the turn that produced them.
+        for tool_trace, _ in finished:
+            trace.extend(tool_trace)
         messages.append({"role": "assistant", "content": resp.content})
-        messages.append({"role": "user", "content": tool_results})
+        messages.append({"role": "user", "content": [result for _, result in finished]})
 
-    return {
-        "memo": "_Iteration cap reached without end_turn — likely a prompt or tooling issue._",
-        "trace": trace,
-        "usage": {},
-    }
+    raise AgentStopped(f"no memo after {MAX_LEAD_TURNS} turns")
 
 
 def _first_text(resp: Any) -> str:
